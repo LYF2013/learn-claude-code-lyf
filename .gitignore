@@ -225,3 +225,10 @@ test_providers.py
 # Internal analysis artifacts (not learning material)
 analysis/
 analysis_progress.md
+/.joycode/prompt.json
+/.idea/.gitignore
+/.idea/learn-claude-code-lyf.iml
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/vcs.xml
