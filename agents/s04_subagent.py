@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-s04_subagent.py - Subagents
+s04_subagent.py - 子智能体 (Subagents)
 
-Spawn a child agent with fresh messages=[]. The child works in its own
-context, sharing the filesystem, then returns only a summary to the parent.
+启动一个子智能体, 使用全新的 messages=[] 空列表。
+子智能体在自己的上下文中工作, 共享文件系统,
+但只返回摘要给父智能体。
 
     Parent agent                     Subagent
     +------------------+             +------------------+
-    | messages=[...]   |             | messages=[]      |  <-- fresh
+    | messages=[...]   |             | messages=[]      |  <-- 全新上下文
     |                  |  dispatch   |                  |
     | tool: task       | ---------->| while tool_use:  |
     |   prompt="..."   |            |   call tools     |
@@ -16,10 +17,10 @@ context, sharing the filesystem, then returns only a summary to the parent.
     |   result = "..." | <--------- | return last text |
     +------------------+             +------------------+
               |
-    Parent context stays clean.
-    Subagent context is discarded.
+    父智能体上下文保持干净
+    子智能体上下文被丢弃
 
-Key insight: "Process isolation gives context isolation for free."
+关键洞察: "进程隔离天然带来上下文隔离。"
 """
 
 import os
@@ -38,18 +39,44 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
+# 父智能体系统提示词: 强调使用 task 工具委托子任务
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
+
+# 子智能体系统提示词: 强调完成后要总结结果
 SUBAGENT_SYSTEM = f"You are a coding subagent at {WORKDIR}. Complete the given task, then summarize your findings."
 
 
-# -- Tool implementations shared by parent and child --
+# ============== 工具实现函数 (父/子智能体共享) ==============
+
 def safe_path(p: str) -> Path:
+    """
+    安全路径解析: 确保路径不会逃逸出工作目录。
+
+    Args:
+        p: 用户提供的文件路径
+
+    Returns:
+        Path: 安全的绝对路径对象
+
+    Raises:
+        ValueError: 如果路径试图逃逸工作目录
+    """
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+
 def run_bash(command: str) -> str:
+    """
+    执行 bash 命令并返回结果。
+
+    Args:
+        command: 要执行的 shell 命令
+
+    Returns:
+        str: 命令输出或错误信息
+    """
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -61,7 +88,18 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+
 def run_read(path: str, limit: int = None) -> str:
+    """
+    读取文件内容。
+
+    Args:
+        path: 文件路径
+        limit: 可选的行数限制
+
+    Returns:
+        str: 文件内容或错误信息
+    """
     try:
         lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
@@ -70,7 +108,18 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_write(path: str, content: str) -> str:
+    """
+    写入文件内容。
+
+    Args:
+        path: 文件路径
+        content: 要写入的内容
+
+    Returns:
+        str: 操作结果描述
+    """
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -79,7 +128,19 @@ def run_write(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """
+    编辑文件: 替换首次匹配的文本。
+
+    Args:
+        path: 文件路径
+        old_text: 要替换的原始文本
+        new_text: 替换后的新文本
+
+    Returns:
+        str: 操作结果描述
+    """
     try:
         fp = safe_path(path)
         content = fp.read_text()
@@ -91,6 +152,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+# 工具分发映射表
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
@@ -98,7 +160,8 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
-# Child gets all base tools except task (no recursive spawning)
+# 子智能体工具列表: 包含所有基础工具, 但没有 task (禁止递归生成子智能体)
+# 这是上下文隔离的关键: 子智能体不能创建子智能体
 CHILD_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -111,29 +174,59 @@ CHILD_TOOLS = [
 ]
 
 
-# -- Subagent: fresh context, filtered tools, summary-only return --
 def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
-    for _ in range(30):  # safety limit
+    """
+    运行子智能体: 使用全新的上下文执行任务, 只返回摘要。
+
+    这是上下文隔离的核心机制:
+    1. 子智能体以空的 messages=[] 启动 (全新上下文)
+    2. 子智能体可以自由调用工具, 累积自己的消息历史
+    3. 子智能体最多运行 30 轮 (安全限制)
+    4. 任务完成后, 子智能体的整个消息历史被丢弃
+    5. 只有最终的文本摘要返回给父智能体
+
+    这意味着子智能体可以读取 100 个文件,
+    但父智能体只收到一句话的摘要,
+    大大节省了父智能体的上下文空间。
+
+    Args:
+        prompt: 子智能体要执行的任务描述
+
+    Returns:
+        str: 子智能体的最终摘要文本
+    """
+    # 全新的消息历史 - 这是上下文隔离的关键
+    sub_messages = [{"role": "user", "content": prompt}]
+
+    # 安全限制: 最多 30 轮工具调用
+    for _ in range(30):
         response = client.messages.create(
             model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
             tools=CHILD_TOOLS, max_tokens=8000,
         )
         sub_messages.append({"role": "assistant", "content": response.content})
+
+        # 如果没有工具调用, 任务完成
         if response.stop_reason != "tool_use":
             break
+
+        # 执行工具调用
         results = []
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                # 限制输出长度, 防止子智能体上下文溢出
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
+
         sub_messages.append({"role": "user", "content": results})
-    # Only the final text returns to the parent -- child context is discarded
+
+    # 只返回最终的文本摘要 - 子智能体的整个上下文被丢弃
     return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
 
 
-# -- Parent tools: base tools + task dispatcher --
+# 父智能体工具列表: 基础工具 + task 工具
+# task 工具是父智能体独有的, 用于委托子任务
 PARENT_TOOLS = CHILD_TOOLS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
      "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
@@ -141,30 +234,57 @@ PARENT_TOOLS = CHILD_TOOLS + [
 
 
 def agent_loop(messages: list):
+    """
+    父智能体核心循环: 处理 task 工具调用时启动子智能体。
+
+    新增功能:
+    1. 支持 task 工具 - 委托子任务给子智能体
+    2. 子智能体运行在独立上下文中
+    3. 只将摘要结果追加到父智能体的消息历史
+
+    Args:
+        messages: 父智能体的消息历史列表
+    """
     while True:
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=PARENT_TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
+
         if response.stop_reason != "tool_use":
             return
+
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                # 特殊处理 task 工具: 启动子智能体
                 if block.name == "task":
                     desc = block.input.get("description", "subtask")
                     print(f"> task ({desc}): {block.input['prompt'][:80]}")
                     output = run_subagent(block.input["prompt"])
                 else:
+                    # 其他工具直接调用处理函数
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+
                 print(f"  {str(output)[:200]}")
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
+
         messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
+    """
+    主程序入口: 提供交互式命令行界面。
+
+    运行方式:
+        python agents/s04_subagent.py
+
+    新增特性:
+        - 父智能体可以使用 task 工具委托子任务
+        - 子智能体在独立上下文中运行, 不污染父智能体的对话历史
+    """
     history = []
     while True:
         try:

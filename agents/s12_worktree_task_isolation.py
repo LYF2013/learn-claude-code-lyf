@@ -598,6 +598,7 @@ TOOLS = [
             "required": ["path", "old_text", "new_text"],
         },
     },
+    # 任务管理工具
     {
         "name": "task_create",
         "description": "Create a new task on the shared task board.",
@@ -725,8 +726,28 @@ TOOLS = [
 ]
 
 
+# =============================================================================
+# 智能体循环 (使用 Anthropic Claude API)
+# =============================================================================
+
 def agent_loop(messages: list):
+    """
+    主循环函数 - 实现 ReAct 模式的智能体循环。
+
+    循环结构:
+    ┌─────────────────────────────────────────────────────┐
+    │  1. 调用 Claude API (带系统提示和消息历史)            │
+    │  2. 如果 stop_reason != "tool_use" → 结束            │
+    │  3. 执行工具调用                                      │
+    │  4. 将结果追加到消息历史                              │
+    │  5. 返回步骤 1                                        │
+    └─────────────────────────────────────────────────────┘
+
+    Args:
+        messages: 消息历史列表 (会被原地修改)
+    """
     while True:
+        # 调用 Claude API
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -734,10 +755,14 @@ def agent_loop(messages: list):
             tools=TOOLS,
             max_tokens=8000,
         )
+        # 追加助手响应到历史
         messages.append({"role": "assistant", "content": response.content})
+
+        # 如果不是工具调用, 结束循环
         if response.stop_reason != "tool_use":
             return
 
+        # 执行工具调用
         results = []
         for block in response.content:
             if block.type == "tool_use":
@@ -754,7 +779,37 @@ def agent_loop(messages: list):
                         "content": str(output),
                     }
                 )
+        # 追加工具结果到历史
         messages.append({"role": "user", "content": results})
+
+
+# =============================================================================
+# 主程序入口
+# =============================================================================
+
+# 系统提示词 - 定义智能体的能力和工作流程
+SYSTEM = """You are an agent with worktree-based task isolation capabilities.
+
+## Capabilities
+- Create, list, update tasks via the task system
+- Create isolated worktrees for each task
+- Run commands in specific worktrees
+- Track events across all operations
+- Remove worktrees when done (optionally complete tasks)
+
+## Typical Workflow
+1. List tasks to find one to work on
+2. Create a worktree bound to the task
+3. Run commands in that worktree
+4. When done, remove worktree and complete task
+
+## Event Types
+- task.created, task.updated, task.completed
+- worktree.create.before/after/failed
+- worktree.remove.before/after/failed
+- worktree.keep
+
+Be concise. Use tools efficiently. Always check worktree status before removal."""
 
 
 if __name__ == "__main__":
@@ -762,6 +817,7 @@ if __name__ == "__main__":
     if not WORKTREES.git_available:
         print("Note: Not in a git repo. worktree_* tools will return errors.")
 
+    # 交互式 REPL 循环
     history = []
     while True:
         try:
@@ -770,8 +826,11 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        # 用户输入加入历史
         history.append({"role": "user", "content": query})
+        # 执行智能体循环
         agent_loop(history)
+        # 输出最终响应
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:

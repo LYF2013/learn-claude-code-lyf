@@ -1,11 +1,28 @@
 #!/usr/bin/env python3
 """
-s10_team_protocols.py - Team Protocols
+s10_team_protocols.py - 团队协议 (Team Protocols)
 
-Shutdown protocol and plan approval protocol, both using the same
-request_id correlation pattern. Builds on s09's team messaging.
+关机协议和计划审批协议, 两者使用相同的 request_id 关联模式。
+在 s09 团队消息系统的基础上构建。
 
-    Shutdown FSM: pending -> approved | rejected
+核心概念:
+=========
+本模块实现两种结构化的请求-响应协议:
+
+1. 关机协议 (Shutdown Protocol):
+   - 领导发送关机请求, 队友批准或拒绝
+   - 避免直接杀线程导致的数据不一致问题
+   - FSM: pending -> approved | rejected
+
+2. 计划审批协议 (Plan Approval Protocol):
+   - 队友提交计划, 领导审查批准或拒绝
+   - 高风险变更需要先过审再执行
+   - FSM: pending -> approved | rejected
+
+协议流程图:
+===========
+
+    关机协议 FSM: pending -> approved | rejected
 
     Lead                              Teammate
     +---------------------+          +---------------------+
@@ -26,7 +43,7 @@ request_id correlation pattern. Builds on s09's team messaging.
             v
     status -> "shutdown", thread stops
 
-    Plan approval FSM: pending -> approved | rejected
+    计划审批 FSM: pending -> approved | rejected
 
     Teammate                          Lead
     +---------------------+          +---------------------+
@@ -41,9 +58,19 @@ request_id correlation pattern. Builds on s09's team messaging.
     +---------------------+          |   approve: true}     |
                                      +---------------------+
 
-    Trackers: {request_id: {"target|from": name, "status": "pending|..."}}
+    追踪器: {request_id: {"target|from": name, "status": "pending|..."}}
 
-Key insight: "Same request_id correlation pattern, two domains."
+关键洞见: "同一个 request_id 关联模式, 两个应用领域。"
+
+相对 s09 的变更:
+================
+| 组件           | 之前 (s09)       | 之后 (s10)                           |
+|----------------|------------------|--------------------------------------|
+| Tools          | 9                | 12 (+shutdown_req/resp +plan)        |
+| 关机           | 仅自然退出       | 请求-响应握手                        |
+| 计划门控       | 无               | 提交/审查与审批                      |
+| 关联           | 无               | 每个请求一个 request_id              |
+| FSM            | 无               | pending -> approved/rejected         |
 """
 
 import json
@@ -61,36 +88,76 @@ load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
-WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
-TEAM_DIR = WORKDIR / ".team"
-INBOX_DIR = TEAM_DIR / "inbox"
+# =============================================================================
+# 全局配置
+# =============================================================================
 
+WORKDIR = Path.cwd()  # 工作目录
+client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))  # Anthropic 客户端
+MODEL = os.environ["MODEL_ID"]  # 模型 ID
+TEAM_DIR = WORKDIR / ".team"  # 团队配置目录
+INBOX_DIR = TEAM_DIR / "inbox"  # 收件箱目录
+
+# 系统提示: 领导角色, 负责管理关机和计划审批协议
 SYSTEM = f"You are a team lead at {WORKDIR}. Manage teammates with shutdown and plan approval protocols."
 
+# 有效消息类型集合 (用于消息验证)
 VALID_MSG_TYPES = {
-    "message",
-    "broadcast",
-    "shutdown_request",
-    "shutdown_response",
-    "plan_approval_response",
+    "message",               # 普通消息
+    "broadcast",             # 广播消息
+    "shutdown_request",      # 关机请求
+    "shutdown_response",     # 关机响应
+    "plan_approval_response", # 计划审批响应
 }
 
-# -- Request trackers: correlate by request_id --
-shutdown_requests = {}
-plan_requests = {}
-_tracker_lock = threading.Lock()
+# =============================================================================
+# 请求追踪器: 通过 request_id 关联请求和响应
+# =============================================================================
+
+shutdown_requests = {}  # 关机请求追踪: {request_id: {"target": name, "status": "pending|..."}}
+plan_requests = {}       # 计划请求追踪: {request_id: {"from": name, "plan": text, "status": "pending|..."}}
+_tracker_lock = threading.Lock()  # 线程锁, 保护追踪器并发访问
 
 
-# -- MessageBus: JSONL inbox per teammate --
+# =============================================================================
+# MessageBus: 每个队友一个 JSONL 收件箱
+# =============================================================================
 class MessageBus:
+    """
+    消息总线, 管理队友之间的异步消息传递。
+
+    每个队友有一个独立的 JSONL 收件箱文件, 支持发送、读取和广播消息。
+    消息按时间戳排序, 读取后清空收件箱 (消费模式)。
+
+    Attributes:
+        dir: 收件箱目录路径
+    """
+
     def __init__(self, inbox_dir: Path):
+        """
+        初始化消息总线。
+
+        Args:
+            inbox_dir: 收件箱目录路径
+        """
         self.dir = inbox_dir
         self.dir.mkdir(parents=True, exist_ok=True)
 
     def send(self, sender: str, to: str, content: str,
              msg_type: str = "message", extra: dict = None) -> str:
+        """
+        发送消息到指定队友的收件箱。
+
+        Args:
+            sender: 发送者名称
+            to: 接收者名称
+            content: 消息内容
+            msg_type: 消息类型 (message/broadcast/shutdown_request 等)
+            extra: 额外字段 (如 request_id, approve 等)
+
+        Returns:
+            发送结果消息
+        """
         if msg_type not in VALID_MSG_TYPES:
             return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
         msg = {
@@ -107,6 +174,15 @@ class MessageBus:
         return f"Sent {msg_type} to {to}"
 
     def read_inbox(self, name: str) -> list:
+        """
+        读取并清空指定队友的收件箱。
+
+        Args:
+            name: 队友名称
+
+        Returns:
+            消息列表 (读取后收件箱被清空)
+        """
         inbox_path = self.dir / f"{name}.jsonl"
         if not inbox_path.exists():
             return []
@@ -114,10 +190,21 @@ class MessageBus:
         for line in inbox_path.read_text().strip().splitlines():
             if line:
                 messages.append(json.loads(line))
-        inbox_path.write_text("")
+        inbox_path.write_text("")  # 清空收件箱
         return messages
 
     def broadcast(self, sender: str, content: str, teammates: list) -> str:
+        """
+        向所有队友广播消息 (排除发送者自己)。
+
+        Args:
+            sender: 发送者名称
+            content: 消息内容
+            teammates: 队友名称列表
+
+        Returns:
+            广播结果消息
+        """
         count = 0
         for name in teammates:
             if name != sender:
@@ -126,12 +213,36 @@ class MessageBus:
         return f"Broadcast to {count} teammates"
 
 
+# 全局消息总线实例
 BUS = MessageBus(INBOX_DIR)
 
 
-# -- TeammateManager with shutdown + plan approval --
+# =============================================================================
+# TeammateManager: 管理队友线程 (包含关机 + 计划审批协议)
+# =============================================================================
 class TeammateManager:
+    """
+    队友管理器, 负责创建、追踪和管理队友线程。
+
+    相对 s09 的增强:
+    - 支持 shutdown_request/shutdown_response 关机握手协议
+    - 支持 plan_approval 计划审批协议
+    - 队友可以提交计划等待领导批准后再执行
+
+    Attributes:
+        dir: 团队配置目录
+        config_path: 配置文件路径
+        config: 配置字典 (包含 team_name 和 members)
+        threads: 线程字典 {name: Thread}
+    """
+
     def __init__(self, team_dir: Path):
+        """
+        初始化队友管理器。
+
+        Args:
+            team_dir: 团队配置目录路径
+        """
         self.dir = team_dir
         self.dir.mkdir(exist_ok=True)
         self.config_path = self.dir / "config.json"
@@ -139,20 +250,52 @@ class TeammateManager:
         self.threads = {}
 
     def _load_config(self) -> dict:
+        """
+        加载团队配置文件。
+
+        Returns:
+            配置字典, 如果文件不存在则返回默认配置
+        """
         if self.config_path.exists():
             return json.loads(self.config_path.read_text())
         return {"team_name": "default", "members": []}
 
     def _save_config(self):
+        """
+        保存配置到文件。
+        """
         self.config_path.write_text(json.dumps(self.config, indent=2))
 
     def _find_member(self, name: str) -> dict:
+        """
+        查找指定名称的队友。
+
+        Args:
+            name: 队友名称
+
+        Returns:
+            队友配置字典, 如果不存在则返回 None
+        """
         for m in self.config["members"]:
             if m["name"] == name:
                 return m
         return None
 
     def spawn(self, name: str, role: str, prompt: str) -> str:
+        """
+        启动一个新的队友线程。
+
+        如果队友已存在且状态为 idle 或 shutdown, 则复用;
+        否则创建新的队友。
+
+        Args:
+            name: 队友名称
+            role: 角色描述
+            prompt: 初始任务提示
+
+        Returns:
+            操作结果消息
+        """
         member = self._find_member(name)
         if member:
             if member["status"] not in ("idle", "shutdown"):
@@ -163,6 +306,8 @@ class TeammateManager:
             member = {"name": name, "role": role, "status": "working"}
             self.config["members"].append(member)
         self._save_config()
+
+        # 创建并启动线程
         thread = threading.Thread(
             target=self._teammate_loop,
             args=(name, role, prompt),
@@ -173,6 +318,20 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
+        """
+        队友的主循环 (在独立线程中运行)。
+
+        循环逻辑:
+        1. 读取收件箱消息
+        2. 调用 LLM 生成响应
+        3. 执行工具调用 (包括 shutdown_response 和 plan_approval)
+        4. 如果批准关机则退出循环
+
+        Args:
+            name: 队友名称
+            role: 角色描述
+            prompt: 初始任务提示
+        """
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Submit plans via plan_approval before major work. "
@@ -180,13 +339,17 @@ class TeammateManager:
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
-        should_exit = False
-        for _ in range(50):
+        should_exit = False  # 关机标志
+
+        for _ in range(50):  # 最多 50 轮对话
+            # 读取收件箱消息
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
+
             if should_exit:
                 break
+
             try:
                 response = client.messages.create(
                     model=MODEL,
@@ -197,9 +360,13 @@ class TeammateManager:
                 )
             except Exception:
                 break
+
             messages.append({"role": "assistant", "content": response.content})
+
             if response.stop_reason != "tool_use":
                 break
+
+            # 执行工具调用
             results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -210,16 +377,34 @@ class TeammateManager:
                         "tool_use_id": block.id,
                         "content": str(output),
                     })
+                    # 如果批准关机, 设置退出标志
                     if block.name == "shutdown_response" and block.input.get("approve"):
                         should_exit = True
             messages.append({"role": "user", "content": results})
+
+        # 更新队友状态
         member = self._find_member(name)
         if member:
             member["status"] = "shutdown" if should_exit else "idle"
             self._save_config()
 
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
-        # these base tools are unchanged from s02
+        """
+        执行工具调用。
+
+        相对 s09 新增:
+        - shutdown_response: 响应关机请求
+        - plan_approval: 提交计划审批
+
+        Args:
+            sender: 发送者 (队友名称)
+            tool_name: 工具名称
+            args: 工具参数
+
+        Returns:
+            工具执行结果
+        """
+        # 基础工具 (与 s02 相同)
         if tool_name == "bash":
             return _run_bash(args["command"])
         if tool_name == "read_file":
@@ -232,6 +417,8 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+
+        # 关机响应: 队友批准或拒绝关机请求
         if tool_name == "shutdown_response":
             req_id = args["request_id"]
             approve = args["approve"]
@@ -243,9 +430,11 @@ class TeammateManager:
                 "shutdown_response", {"request_id": req_id, "approve": approve},
             )
             return f"Shutdown {'approved' if approve else 'rejected'}"
+
+        # 计划审批: 队友提交计划等待领导批准
         if tool_name == "plan_approval":
             plan_text = args.get("plan", "")
-            req_id = str(uuid.uuid4())[:8]
+            req_id = str(uuid.uuid4())[:8]  # 生成唯一请求 ID
             with _tracker_lock:
                 plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
             BUS.send(
@@ -253,10 +442,20 @@ class TeammateManager:
                 {"request_id": req_id, "plan": plan_text},
             )
             return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
+
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
-        # these base tools are unchanged from s02
+        """
+        返回队友可用的工具定义列表。
+
+        相对 s09 新增:
+        - shutdown_response: 响应关机请求
+        - plan_approval: 提交计划审批
+
+        Returns:
+            工具定义列表
+        """
         return [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -270,13 +469,21 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
+            # 新增: 关机响应工具
             {"name": "shutdown_response", "description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
              "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
+            # 新增: 计划审批工具
             {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
              "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
         ]
 
     def list_all(self) -> str:
+        """
+        列出所有队友及其状态。
+
+        Returns:
+            队友列表的格式化字符串
+        """
         if not self.config["members"]:
             return "No teammates."
         lines = [f"Team: {self.config['team_name']}"]
@@ -285,9 +492,16 @@ class TeammateManager:
         return "\n".join(lines)
 
     def member_names(self) -> list:
+        """
+        获取所有队友名称列表。
+
+        Returns:
+            队友名称列表
+        """
         return [m["name"] for m in self.config["members"]]
 
 
+# 全局队友管理器实例
 TEAM = TeammateManager(TEAM_DIR)
 
 
